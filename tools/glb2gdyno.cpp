@@ -129,14 +129,8 @@ namespace {
                     if (colAcc) cgltf_accessor_read_float(colAcc, v, vCol, 4);
 
                     gdyno::PackedVertex pv{};
-                    if (primSkinned) {
-                        // Для скиннинга вершины хранятся в bind-пространстве меша
-                        pv.position[0] = rawPos[0]; pv.position[1] = rawPos[1]; pv.position[2] = rawPos[2];
-                        pv.normal[0] = rawNorm[0]; pv.normal[1] = rawNorm[1]; pv.normal[2] = rawNorm[2];
-                    } else {
-                        transformPoint(worldMat, rawPos, pv.position);
-                        transformDir(worldMat, rawNorm, pv.normal);
-                    }
+                    transformPoint(worldMat, rawPos, pv.position);
+                    transformDir(worldMat, rawNorm, pv.normal);
 
                     pv.uv[0] = uv[0];
                     pv.uv[1] = uv[1];
@@ -268,11 +262,27 @@ int main(int argc, char** argv) {
                 auto it = boneNodeMap.find(jNode->parent);
                 if (it != boneNodeMap.end()) bn.parentIndex = it->second;
             }
-            if (skin.inverse_bind_matrices) {
-                std::memcpy(bn.inverseBindMatrix.data(), &ibmFlat[i * 16], 16 * sizeof(float));
-            } else {
-                bn.inverseBindMatrix = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
-            }
+            float jWorld[16];
+            cgltf_node_transform_world(jNode, jWorld);
+            float sxW = std::sqrt(jWorld[0]*jWorld[0] + jWorld[1]*jWorld[1] + jWorld[2]*jWorld[2]);
+            float syW = std::sqrt(jWorld[4]*jWorld[4] + jWorld[5]*jWorld[5] + jWorld[6]*jWorld[6]);
+            float szW = std::sqrt(jWorld[8]*jWorld[8] + jWorld[9]*jWorld[9] + jWorld[10]*jWorld[10]);
+            float invSx = sxW > 1e-6f ? 1.0f / sxW : 1.0f;
+            float invSy = syW > 1e-6f ? 1.0f / syW : 1.0f;
+            float invSz = szW > 1e-6f ? 1.0f / szW : 1.0f;
+            float r00 = jWorld[0]*invSx, r01 = jWorld[4]*invSy, r02 = jWorld[8]*invSz;
+            float r10 = jWorld[1]*invSx, r11 = jWorld[5]*invSy, r12 = jWorld[9]*invSz;
+            float r20 = jWorld[2]*invSx, r21 = jWorld[6]*invSy, r22 = jWorld[10]*invSz;
+            float tx = jWorld[12], ty = jWorld[13], tz = jWorld[14];
+            bn.inverseBindMatrix = {
+                r00 * invSx, r01 * invSy, r02 * invSz, 0.0f,
+                r10 * invSx, r11 * invSy, r12 * invSz, 0.0f,
+                r20 * invSx, r21 * invSy, r22 * invSz, 0.0f,
+                -(r00*tx + r10*ty + r20*tz) * invSx,
+                -(r01*tx + r11*ty + r21*tz) * invSy,
+                -(r02*tx + r12*ty + r22*tz) * invSz,
+                1.0f
+            };
             if (jNode->has_translation) {
                 bn.bindLocalPos = { jNode->translation[0], jNode->translation[1], jNode->translation[2] };
             }
@@ -281,6 +291,46 @@ int main(int argc, char** argv) {
             }
             if (jNode->has_scale) {
                 bn.bindLocalScale = { jNode->scale[0], jNode->scale[1], jNode->scale[2] };
+            }
+            if (bn.parentIndex == -1 && jNode->parent != nullptr) {
+                float pWorld[16];
+                cgltf_node_transform_world(jNode->parent, pWorld);
+                float jLocal[16];
+                cgltf_node_transform_local(jNode, jLocal);
+                float comb[16];
+                for (int col = 0; col < 4; ++col) {
+                    for (int row = 0; row < 4; ++row) {
+                        comb[col * 4 + row] =
+                        pWorld[0 * 4 + row] * jLocal[col * 4 + 0] +
+                        pWorld[1 * 4 + row] * jLocal[col * 4 + 1] +
+                        pWorld[2 * 4 + row] * jLocal[col * 4 + 2] +
+                        pWorld[3 * 4 + row] * jLocal[col * 4 + 3];
+                    }
+                }
+                bn.bindLocalPos = { comb[12], comb[13], comb[14] };
+                float sx = std::sqrt(comb[0]*comb[0] + comb[1]*comb[1] + comb[2]*comb[2]);
+                float sy = std::sqrt(comb[4]*comb[4] + comb[5]*comb[5] + comb[6]*comb[6]);
+                float sz = std::sqrt(comb[8]*comb[8] + comb[9]*comb[9] + comb[10]*comb[10]);
+                bn.bindLocalScale = { sx, sy, sz };
+                if (sx > 1e-6f && sy > 1e-6f && sz > 1e-6f) {
+                    float m00 = comb[0]/sx, m01 = comb[4]/sy, m02 = comb[8]/sz;
+                    float m10 = comb[1]/sx, m11 = comb[5]/sy, m12 = comb[9]/sz;
+                    float m20 = comb[2]/sx, m21 = comb[6]/sy, m22 = comb[10]/sz;
+                    float tr = m00 + m11 + m22;
+                    if (tr > 0.0f) {
+                        float s = std::sqrt(tr + 1.0f) * 2.0f;
+                        bn.bindLocalRot = { (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s };
+                    } else if ((m00 > m11) && (m00 > m22)) {
+                        float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+                        bn.bindLocalRot = { 0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s };
+                    } else if (m11 > m22) {
+                        float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+                        bn.bindLocalRot = { (m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s };
+                    } else {
+                        float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+                        bn.bindLocalRot = { (m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s };
+                    }
+                }
             }
             model.bones.push_back(std::move(bn));
         }
@@ -402,6 +452,52 @@ int main(int argc, char** argv) {
             sk.position.x = sk.position.x * scaleFactor + offsetX;
             sk.position.y = sk.position.y * scaleFactor + offsetY;
             sk.position.z = sk.position.z * scaleFactor + offsetZ;
+        }
+
+        if (anySkinned) {
+            float liftY = opts.groundCenter ? (-minP[1] * scaleFactor) : 0.0f;
+            if (std::abs(liftY) > 1e-5f) {
+                for (auto& v : model.vertices) {
+                    v.position[1] += liftY;
+                }
+                for (auto& sk : model.sockets) {
+                    sk.position.y += liftY;
+                }
+                finalMin[1] += liftY;
+                finalMax[1] += liftY;
+            }
+
+            for (size_t bIdx = 0; bIdx < model.bones.size(); ++bIdx) {
+                auto& bn = model.bones[bIdx];
+                bn.bindLocalPos.x *= scaleFactor;
+                bn.bindLocalPos.y *= scaleFactor;
+                bn.bindLocalPos.z *= scaleFactor;
+                bn.inverseBindMatrix[12] *= scaleFactor;
+                bn.inverseBindMatrix[13] *= scaleFactor;
+                bn.inverseBindMatrix[14] *= scaleFactor;
+
+                if (std::abs(liftY) > 1e-5f) {
+                    if (bn.parentIndex == -1) {
+                        bn.bindLocalPos.y += liftY;
+                    }
+                    bn.inverseBindMatrix[12] -= bn.inverseBindMatrix[4] * liftY;
+                    bn.inverseBindMatrix[13] -= bn.inverseBindMatrix[5] * liftY;
+                    bn.inverseBindMatrix[14] -= bn.inverseBindMatrix[6] * liftY;
+                }
+            }
+
+            for (auto& clip : model.animations) {
+                for (auto& ch : clip.channels) {
+                    bool isRoot = (ch.boneIndex >= 0 &&
+                    static_cast<size_t>(ch.boneIndex) < model.bones.size() &&
+                    model.bones[ch.boneIndex].parentIndex == -1);
+                    for (auto& pk : ch.posKeys) {
+                        pk.value.x *= scaleFactor;
+                        pk.value.y = pk.value.y * scaleFactor + (isRoot ? liftY : 0.0f);
+                        pk.value.z *= scaleFactor;
+                    }
+                }
+            }
         }
 
         model.aabbMin = { finalMin[0], finalMin[1], finalMin[2] };
